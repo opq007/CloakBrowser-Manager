@@ -119,7 +119,7 @@ def test_validate_no_port():
 # ── _build_fingerprint_args ──────────────────────────────────────────────────
 
 # Use the BrowserManager instance to call the method
-_mgr = BrowserManager()
+_mgr = BrowserManager(enable_vnc=True)
 
 
 def test_build_args_always_includes_base():
@@ -170,6 +170,14 @@ def test_build_args_empty_profile():
     assert len(args) == 3
 
 
+def test_build_args_without_vnc_skips_software_gl():
+    args = BrowserManager(enable_vnc=False)._build_fingerprint_args({})
+    assert "--disable-infobars" in args
+    assert "--test-type" in args
+    assert "--use-angle=swiftshader" not in args
+    assert len(args) == 2
+
+
 @pytest.mark.asyncio
 async def test_launch_without_vnc_skips_display_and_xvnc(tmp_path: Path):
     mgr = BrowserManager(enable_vnc=False)
@@ -179,6 +187,9 @@ async def test_launch_without_vnc_skips_display_and_xvnc(tmp_path: Path):
 
     context = MagicMock()
     context.pages = []
+    page = AsyncMock()
+    page.url = "about:blank"
+    context.new_page = AsyncMock(return_value=page)
     context.add_init_script = AsyncMock()
     context.on = MagicMock()
 
@@ -200,7 +211,14 @@ async def test_launch_without_vnc_skips_display_and_xvnc(tmp_path: Path):
     mgr.vnc.allocate.assert_not_called()
     mgr.vnc.start_vnc.assert_not_called()
     mgr.vnc.stop_vnc.assert_not_called()
-    assert "DISPLAY" not in launch_mock.call_args.kwargs["env"]
+    launch_kwargs = launch_mock.call_args.kwargs
+    assert "DISPLAY" not in launch_kwargs["env"]
+    assert "--use-angle=swiftshader" not in launch_kwargs["args"]
+    assert "--start-maximized" in launch_kwargs["args"]
+    assert "--new-window" in launch_kwargs["args"]
+    context.new_page.assert_awaited_once()
+    page.set_content.assert_awaited_once()
+    page.bring_to_front.assert_awaited_once()
 
 
 def test_get_status_running_without_vnc():

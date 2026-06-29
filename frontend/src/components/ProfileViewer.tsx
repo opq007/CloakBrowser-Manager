@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { ClipboardCopy, Code2, Maximize2, Minimize2 } from "lucide-react";
+import { ClipboardCopy, Code2, Maximize2, Minimize2, Monitor } from "lucide-react";
 import { api } from "../lib/api";
 
 interface ProfileViewerProps {
   profileId: string;
+  vncWsPort: number | null;
   cdpUrl: string | null;
   clipboardSync: boolean;
   onDisconnect: () => void;
@@ -12,9 +13,10 @@ interface ProfileViewerProps {
 // X11 keysym for V key (Ctrl is already held in VNC by the time we intercept)
 const XK_v = 0x0076;
 
-export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboardSync, onDisconnect }: ProfileViewerProps) {
+export function ProfileViewer({ profileId, vncWsPort, cdpUrl, clipboardSync: initialClipboardSync, onDisconnect }: ProfileViewerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rfbRef = useRef<any>(null);
+  const hasVnc = vncWsPort !== null;
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
@@ -26,6 +28,12 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
     let cancelled = false;
 
     async function connect() {
+      if (!hasVnc) {
+        setConnected(false);
+        setError(null);
+        return;
+      }
+
       try {
         // Import noVNC dynamically
         const { default: RFB } = await import("@novnc/novnc/core/rfb.js");
@@ -78,13 +86,13 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
       }
       rfbRef.current = null;
     };
-  }, [profileId, onDisconnect]);
+  }, [profileId, hasVnc, onDisconnect]);
 
   // Host→VNC: intercept Ctrl+V/Cmd+V at keydown (capture phase)
   // Must fire BEFORE noVNC's canvas listener to prevent the race condition
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || !clipboardSync || !connected) return;
+    if (!hasVnc || !container || !clipboardSync || !connected) return;
 
     const handleKeyDown = async (e: KeyboardEvent) => {
       console.log("[clipboard] keydown:", e.key, "ctrl:", e.ctrlKey, "meta:", e.metaKey, "clipboardSync:", true);
@@ -131,14 +139,14 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
     // capture: true ensures we fire before noVNC's canvas listener
     container.addEventListener("keydown", handleKeyDown, true);
     return () => container.removeEventListener("keydown", handleKeyDown, true);
-  }, [profileId, clipboardSync, connected]);
+  }, [profileId, clipboardSync, connected, hasVnc]);
 
   // VNC→Host: listen for noVNC "clipboard" event (fired when proxy converts
   // KasmVNC BinaryClipboard type 180 → standard ServerCutText type 3)
   useEffect(() => {
     const rfb = rfbRef.current;
     console.log("[clipboard] VNC→Host effect: rfb=", !!rfb, "sync=", clipboardSync, "connected=", connected);
-    if (!rfb || !clipboardSync || !connected) return;
+    if (!hasVnc || !rfb || !clipboardSync || !connected) return;
 
     const handleClipboard = (e: any) => {
       const text = e.detail?.text;
@@ -158,12 +166,12 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
       console.log("[clipboard] removing clipboard event listener");
       rfb.removeEventListener("clipboard", handleClipboard);
     };
-  }, [clipboardSync, connected]);
+  }, [clipboardSync, connected, hasVnc]);
 
   // VNC→Host polling: Chrome doesn't write to X11 clipboard under KasmVNC,
   // so type 180 events won't fire for Chrome copies. Poll via Playwright CDP.
   useEffect(() => {
-    if (!clipboardSync || !connected) return;
+    if (!hasVnc || !clipboardSync || !connected) return;
 
     let cancelled = false;
     let lastText = "";
@@ -195,10 +203,10 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [profileId, clipboardSync, connected]);
+  }, [profileId, clipboardSync, connected, hasVnc]);
 
   const toggleFullscreen = () => {
-    if (!containerRef.current) return;
+    if (!hasVnc || !containerRef.current) return;
     if (!document.fullscreenElement) {
       containerRef.current.requestFullscreen();
       setFullscreen(true);
@@ -227,6 +235,49 @@ export function ProfileViewer({ profileId, cdpUrl, clipboardSync: initialClipboa
     container.addEventListener("wheel", handleWheel, { passive: false });
     return () => container.removeEventListener("wheel", handleWheel);
   }, []);
+
+  if (!hasVnc) {
+    return (
+      <div className="relative h-full flex flex-col">
+        <div className="flex items-center justify-between px-3 py-1.5 bg-surface-1 border-b border-border">
+          <div className="flex items-center gap-2">
+            <span className="h-2 w-2 rounded-full bg-emerald-400" />
+            <span className="text-xs text-gray-400">Local window</span>
+          </div>
+          <div className="flex items-center gap-1">
+            {cdpUrl && (
+              <button
+                onClick={() => {
+                  const base = `${window.location.protocol}//${window.location.host}${cdpUrl}`;
+                  navigator.clipboard?.writeText(base).then(() => {
+                    setCdpCopied(true);
+                    setTimeout(() => setCdpCopied(false), 2000);
+                  }).catch((err) => console.warn("[cdp] copy failed:", err));
+                }}
+                className={`p-1 ${cdpCopied ? "text-emerald-400" : "text-gray-500 hover:text-gray-300"}`}
+                title={cdpCopied ? "Copied!" : "Copy CDP endpoint URL"}
+              >
+                <Code2 className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="flex-1 bg-surface-0 flex items-center justify-center px-6">
+          <div className="max-w-md text-center">
+            <Monitor className="h-10 w-10 text-accent mx-auto mb-4" />
+            <p className="text-sm font-medium text-gray-200 mb-2">
+              Browser is running in a Windows desktop window
+            </p>
+            <p className="text-xs text-gray-500 leading-5">
+              Use the CloakBrowser window that opened on this machine for manual operation.
+              The web dashboard stays available for profile controls, clipboard relay, and CDP access.
+            </p>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   if (error) {
     return (

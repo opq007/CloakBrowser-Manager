@@ -246,6 +246,7 @@ function AppContent({ authRequired, onLogout }: AppContentProps) {
             <ProfileViewer
               key={selected.id}
               profileId={selected.id}
+              vncWsPort={selected.vnc_ws_port}
               cdpUrl={selected.cdp_url}
               clipboardSync={selected.clipboard_sync}
               onDisconnect={handleVncDisconnect}

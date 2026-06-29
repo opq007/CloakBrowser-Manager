@@ -81,6 +81,14 @@ describe("api.launchProfile", () => {
     expect(data.vnc_ws_port).toBe(6100);
     expect(mockFetch.mock.calls[0][0]).toBe("/api/profiles/1/launch");
   });
+
+  it("accepts non-VNC launch results", async () => {
+    const result = { profile_id: "1", status: "running", vnc_ws_port: null, display: null };
+    mockFetch.mockResolvedValueOnce(jsonResponse(result));
+    const data = await api.launchProfile("1");
+    expect(data.vnc_ws_port).toBeNull();
+    expect(data.display).toBeNull();
+  });
 });
 
 // ── stopProfile ─────────────────────────────────────────────────────────────

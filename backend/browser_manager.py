@@ -10,6 +10,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from typing import Any
 
@@ -200,6 +201,54 @@ def _ensure_playwright_subprocess_support() -> None:
         )
 
 
+def _local_start_page(profile: dict[str, Any]) -> str:
+    name = escape(str(profile.get("name") or "CloakBrowser Profile"))
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{name}</title>
+  <style>
+    html, body {{
+      height: 100%;
+      margin: 0;
+      font-family: Segoe UI, Arial, sans-serif;
+      background: #f6f7f9;
+      color: #20242a;
+    }}
+    body {{
+      display: grid;
+      place-items: center;
+    }}
+    main {{
+      max-width: 560px;
+      padding: 32px;
+      border: 1px solid #d7dce2;
+      background: #ffffff;
+      box-shadow: 0 12px 30px rgba(15, 23, 42, 0.08);
+    }}
+    h1 {{
+      margin: 0 0 10px;
+      font-size: 22px;
+      font-weight: 650;
+    }}
+    p {{
+      margin: 0;
+      font-size: 14px;
+      line-height: 1.6;
+      color: #56606c;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{name}</h1>
+    <p>This local browser window is ready. Use the address bar above to browse manually.</p>
+  </main>
+</body>
+</html>"""
+
+
 class BrowserManager:
     def __init__(self, enable_vnc: bool | None = None):
         self.running: dict[str, RunningProfile] = {}
@@ -258,6 +307,10 @@ class BrowserManager:
             # Build fingerprint args from profile settings
             extra_args = self._build_fingerprint_args(profile)
             extra_args += profile.get("launch_args") or []
+            if not self.enable_vnc:
+                for arg in ("--start-maximized", "--new-window"):
+                    if arg not in extra_args:
+                        extra_args.append(arg)
             extra_args.append(f"--remote-debugging-port={cdp_port}")
 
             # Normalize proxy format (host:port:user:pass → http://user:pass@host:port)
@@ -314,6 +367,9 @@ class BrowserManager:
                     await p.evaluate(_clipboard_init_js)
                 except Exception as exc:
                     logger.debug("Clipboard init failed on existing page: %s", exc)
+
+            if not self.enable_vnc and not bool(profile.get("headless", False)):
+                await self._prepare_local_browser_window(context, profile)
 
             running = RunningProfile(
                 profile_id=profile_id,
@@ -448,8 +504,9 @@ class BrowserManager:
         args: list[str] = [
             "--disable-infobars",
             "--test-type",  # suppress "unsupported flag: --no-sandbox" bad flags warning
-            "--use-angle=swiftshader",  # software GL for VNC (no GPU in container)
         ]
+        if self.enable_vnc:
+            args.append("--use-angle=swiftshader")  # software GL for VNC (no GPU in container)
 
         seed = profile.get("fingerprint_seed")
         if seed is not None:
@@ -480,3 +537,22 @@ class BrowserManager:
             args.append(f"--fingerprint-screen-height={sh}")
 
         return args
+
+    async def _prepare_local_browser_window(self, context: Any, profile: dict[str, Any]) -> None:
+        """Make the host-visible non-VNC browser window immediately usable."""
+        try:
+            pages = list(getattr(context, "pages", []) or [])
+            if pages:
+                page = pages[0]
+            else:
+                page = await context.new_page()
+
+            if getattr(page, "url", "") in ("", "about:blank"):
+                await page.set_content(_local_start_page(profile))
+
+            try:
+                await page.bring_to_front()
+            except Exception as exc:
+                logger.debug("Failed to focus local browser window: %s", exc)
+        except Exception as exc:
+            logger.warning("Failed to prepare local browser window: %s", exc)
