@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
-from dataclasses import dataclass, field
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger("cloakbrowser.manager.vnc")
 
@@ -25,6 +28,10 @@ class VNCManager:
     def __init__(self):
         self._allocated: dict[int, VNCInstance] = {}
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def get_log_path(display: int) -> Path:
+        return Path(tempfile.gettempdir()) / f"xvnc-{display}.log"
 
     async def allocate(self) -> tuple[int, int]:
         """Returns (display_number, ws_port) for a new profile."""
@@ -64,7 +71,7 @@ class VNCManager:
             "-httpd", httpd_dir,
         ]
 
-        log_path = f"/tmp/xvnc-{display}.log"
+        log_path = self.get_log_path(display)
         logger.info("Starting Xvnc on :%d (ws_port=%d) log=%s", display, ws_port, log_path)
 
         log_file = open(log_path, "w")
@@ -80,8 +87,7 @@ class VNCManager:
 
         if proc.poll() is not None:
             try:
-                with open(log_path) as f:
-                    err = f.read()
+                err = log_path.read_text()
             except Exception as exc:
                 logger.debug("Failed to read Xvnc log %s: %s", log_path, exc)
                 err = ""
@@ -118,6 +124,9 @@ class VNCManager:
 
     async def cleanup_stale(self):
         """Kill orphan Xvnc processes from previous runs."""
+        if os.name == "nt":
+            logger.debug("Skipping stale Xvnc cleanup on Windows")
+            return
         try:
             result = subprocess.run(
                 ["pkill", "-f", r"Xvnc :[0-9]"],

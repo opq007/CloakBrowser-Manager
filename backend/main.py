@@ -24,19 +24,34 @@ from fastapi.staticfiles import StaticFiles
 import starlette.requests
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from . import database as db
-from .browser_manager import BrowserManager
-from .models import (
-    ClipboardRequest,
-    LaunchResponse,
-    LoginRequest,
-    ProfileCreate,
-    ProfileResponse,
-    ProfileStatusResponse,
-    ProfileUpdate,
-    StatusResponse,
-    TagResponse,
-)
+if __package__:
+    from . import database as db
+    from .browser_manager import BrowserManager
+    from .models import (
+        ClipboardRequest,
+        LaunchResponse,
+        LoginRequest,
+        ProfileCreate,
+        ProfileResponse,
+        ProfileStatusResponse,
+        ProfileUpdate,
+        StatusResponse,
+        TagResponse,
+    )
+else:
+    import database as db
+    from browser_manager import BrowserManager
+    from models import (
+        ClipboardRequest,
+        LaunchResponse,
+        LoginRequest,
+        ProfileCreate,
+        ProfileResponse,
+        ProfileStatusResponse,
+        ProfileUpdate,
+        StatusResponse,
+        TagResponse,
+    )
 
 logger = logging.getLogger("cloakbrowser.manager")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
@@ -542,7 +557,7 @@ async def launch_profile(profile_id: str):
         profile_id=profile_id,
         status="running",
         vnc_ws_port=running.ws_port,
-        display=f":{running.display}",
+        display=f":{running.display}" if running.display is not None else None,
         cdp_url=f"/api/profiles/{profile_id}/cdp",
     )
 
@@ -585,14 +600,45 @@ _CLIPBOARD_MAX_READ = 1_048_576  # 1MB cap on GET response
 
 # Track xclip processes per display so we can kill the old one before spawning new
 _xclip_procs: dict[int, asyncio.subprocess.Process] = {}
+_profile_clipboards: dict[str, str] = {}
+
+
+async def _set_browser_clipboard_text(running, text: str) -> None:
+    context = getattr(running, "context", None)
+    if not context:
+        return
+
+    script = """
+        async (text) => {
+            window.__clipboardText = text;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                try {
+                    await navigator.clipboard.writeText(text);
+                } catch (e) {
+                    // Browser clipboard writes may require user activation.
+                }
+            }
+        }
+    """
+    for page in getattr(context, "pages", []):
+        try:
+            await page.evaluate(script, text)
+        except Exception as exc:
+            logger.debug("Browser clipboard write failed on page: %s", exc)
 
 
 @app.post("/api/profiles/{profile_id}/clipboard")
 async def set_clipboard(profile_id: str, body: ClipboardRequest):
-    """Push text into the VNC session's X clipboard via xclip."""
+    """Push text into the profile clipboard."""
     running = browser_mgr.running.get(profile_id)
     if not running:
         raise HTTPException(status_code=404, detail="Profile not running")
+
+    _profile_clipboards[profile_id] = body.text
+    await _set_browser_clipboard_text(running, body.text)
+
+    if running.display is None:
+        return {"ok": True}
 
     import os
 
@@ -620,11 +666,11 @@ async def set_clipboard(profile_id: str, body: ClipboardRequest):
 
 @app.get("/api/profiles/{profile_id}/clipboard")
 async def get_clipboard(profile_id: str):
-    """Read the VNC session's clipboard.
+    """Read the profile clipboard.
 
     Chrome doesn't write to X11 clipboard under KasmVNC, so xclip can't read it.
     Instead, read via Playwright's CDP connection to Chrome (navigator.clipboard.readText).
-    Falls back to xclip for non-Chrome clipboard owners.
+    Falls back to xclip for VNC sessions and to the in-process cache otherwise.
     """
     running = browser_mgr.running.get(profile_id)
     if not running:
@@ -646,6 +692,9 @@ async def get_clipboard(profile_id: str):
                 continue
     except Exception as exc:
         logger.debug("Playwright clipboard read failed: %s", exc)
+
+    if running.display is None:
+        return {"text": _profile_clipboards.get(profile_id, "")[:_CLIPBOARD_MAX_READ]}
 
     # Fallback: xclip for non-Chrome clipboard owners
     import os
@@ -683,6 +732,9 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
     running = browser_mgr.running.get(profile_id)
     if not running:
         await websocket.close(code=4004, reason="Profile not running")
+        return
+    if running.display is None or running.ws_port is None:
+        await websocket.close(code=4004, reason="VNC not available")
         return
 
     # Accept with client's requested subprotocol (if any) — RFC 6455 requires
@@ -816,11 +868,9 @@ async def vnc_proxy(websocket: WebSocket, profile_id: str):
             )
 
             # Dump Xvnc log on disconnect
-            import os
-            xvnc_log = f"/tmp/xvnc-{running.display}.log"
-            if os.path.exists(xvnc_log):
-                with open(xvnc_log) as f:
-                    log_content = f.read()
+            xvnc_log = browser_mgr.vnc.get_log_path(running.display)
+            if xvnc_log.exists():
+                log_content = xvnc_log.read_text(errors="replace")
                 if log_content.strip():
                     for line in log_content.strip().split("\n")[-20:]:
                         logger.info("Xvnc[:%d] %s", running.display, line)

@@ -159,6 +159,12 @@ def test_launch_response_cdp_url_default_none():
     assert r.cdp_url is None
 
 
+def test_launch_response_without_vnc():
+    r = LaunchResponse(profile_id="abc", cdp_url="/api/profiles/abc/cdp")
+    assert r.vnc_ws_port is None
+    assert r.display is None
+
+
 # ── ProfileStatusResponse ──────────────────────────────────────────────────
 
 

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,10 @@ from typing import Any
 
 from cloakbrowser import launch_persistent_context_async
 
-from .vnc_manager import VNCManager
+if __package__:
+    from .vnc_manager import VNCManager
+else:
+    from vnc_manager import VNCManager
 
 logger = logging.getLogger("cloakbrowser.manager.browser")
 
@@ -146,19 +150,42 @@ BASE_CDP_PORT = 5100
 CDP_PORT_RANGE = 100  # cycle through 5100-5199 to avoid TIME_WAIT collisions
 
 
+def _env_flag(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    logger.warning("Ignoring invalid boolean value for %s=%r", name, raw)
+    return None
+
+
+def _default_enable_vnc() -> bool:
+    configured = _env_flag("CLOAKBROWSER_MANAGER_VNC")
+    if configured is None:
+        configured = _env_flag("ENABLE_VNC")
+    if configured is not None:
+        return configured
+    return sys.platform != "win32"
+
+
 @dataclass
 class RunningProfile:
     profile_id: str
     context: Any  # Playwright BrowserContext
-    display: int
-    ws_port: int
+    display: int | None
+    ws_port: int | None
     cdp_port: int
 
 
 class BrowserManager:
-    def __init__(self):
+    def __init__(self, enable_vnc: bool | None = None):
         self.running: dict[str, RunningProfile] = {}
         self._launching: set[str] = set()  # profile IDs currently being launched
+        self.enable_vnc = _default_enable_vnc() if enable_vnc is None else enable_vnc
         self.vnc = VNCManager()
         self._lock = asyncio.Lock()
         self._next_cdp_port = BASE_CDP_PORT
@@ -173,14 +200,18 @@ class BrowserManager:
                 raise RuntimeError(f"Profile {profile_id} is already running")
             self._launching.add(profile_id)
 
-        display, ws_port = await self.vnc.allocate()
+        display: int | None = None
+        ws_port: int | None = None
+        if self.enable_vnc:
+            display, ws_port = await self.vnc.allocate()
 
         try:
             cdp_port = self._allocate_cdp_port()
         except ValueError:
             async with self._lock:
                 self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
+            if display is not None:
+                await self.vnc.stop_vnc(display)
             raise
 
         # Clean stale Chromium lock files (left by previous container crashes)
@@ -193,13 +224,16 @@ class BrowserManager:
         _init_profile_defaults(user_data_dir)
 
         try:
-            # Start KasmVNC on the allocated display
-            await self.vnc.start_vnc(
-                display,
-                ws_port,
-                width=profile.get("screen_width", 1920),
-                height=profile.get("screen_height", 1080),
-            )
+            if self.enable_vnc:
+                assert display is not None
+                assert ws_port is not None
+                # Start KasmVNC on the allocated display
+                await self.vnc.start_vnc(
+                    display,
+                    ws_port,
+                    width=profile.get("screen_width", 1920),
+                    height=profile.get("screen_height", 1080),
+                )
 
             # Build fingerprint args from profile settings
             extra_args = self._build_fingerprint_args(profile)
@@ -212,8 +246,13 @@ class BrowserManager:
             if proxy:
                 _validate_proxy(proxy)
 
-            # Launch CloakBrowser on that display
-            # DISPLAY is passed via env kwarg to avoid process-wide os.environ mutation
+            launch_env = dict(os.environ)
+            if display is not None:
+                launch_env["DISPLAY"] = f":{display}"
+
+            # DISPLAY is passed via env kwarg to avoid process-wide os.environ mutation.
+            # On Windows/non-VNC runs there is no virtual display, so the host desktop
+            # is used and no DISPLAY value is injected.
             context = await launch_persistent_context_async(
                 user_data_dir=profile["user_data_dir"],
                 headless=bool(profile.get("headless", False)),
@@ -230,7 +269,7 @@ class BrowserManager:
                     "width": profile.get("screen_width", 1920),
                     "height": profile.get("screen_height", 1080) - 133,
                 },
-                env={**os.environ, "DISPLAY": f":{display}"},
+                env=launch_env,
             )
 
             # Inject clipboard listener: captures copied text on every page
@@ -274,8 +313,8 @@ class BrowserManager:
                 self._launching.discard(profile_id)
 
             logger.info(
-                "Launched profile %s on display :%d (ws_port=%d, cdp_port=%d)",
-                profile_id, display, ws_port, cdp_port,
+                "Launched profile %s (vnc=%s, display=%s, ws_port=%s, cdp_port=%d)",
+                profile_id, self.enable_vnc, f":{display}" if display is not None else None, ws_port, cdp_port,
             )
 
             return running
@@ -283,7 +322,8 @@ class BrowserManager:
         except BaseException:
             async with self._lock:
                 self._launching.discard(profile_id)
-            await self.vnc.stop_vnc(display)
+            if display is not None:
+                await self.vnc.stop_vnc(display)
             raise
 
     async def _on_browser_closed(self, profile_id: str):
@@ -293,7 +333,8 @@ class BrowserManager:
 
         if running:
             logger.info("Browser closed for profile %s, cleaning up", profile_id)
-            await self.vnc.stop_vnc(running.display)
+            if running.display is not None:
+                await self.vnc.stop_vnc(running.display)
 
     async def stop(self, profile_id: str):
         """Stop a running browser instance."""
@@ -311,7 +352,8 @@ class BrowserManager:
         except Exception as exc:
             logger.warning("Error closing context for %s: %s", profile_id, exc)
 
-        await self.vnc.stop_vnc(running.display)
+        if running.display is not None:
+            await self.vnc.stop_vnc(running.display)
 
     def get_status(self, profile_id: str) -> dict[str, Any]:
         """Get running status for a profile."""
@@ -320,7 +362,7 @@ class BrowserManager:
             return {
                 "status": "running",
                 "vnc_ws_port": running.ws_port,
-                "display": f":{running.display}",
+                "display": f":{running.display}" if running.display is not None else None,
                 "cdp_url": f"/api/profiles/{profile_id}/cdp",
             }
         return {"status": "stopped", "vnc_ws_port": None, "display": None, "cdp_url": None}
@@ -333,15 +375,20 @@ class BrowserManager:
         for pid in profile_ids:
             await self.stop(pid)
 
-        await self.vnc.cleanup_all()
+        if self.enable_vnc:
+            await self.vnc.cleanup_all()
 
     async def cleanup_stale(self):
         """Kill orphan processes from previous container runs."""
-        await self.vnc.cleanup_stale()
+        if self.enable_vnc:
+            await self.vnc.cleanup_stale()
 
     async def auto_launch_all(self):
         """Launch all profiles with auto_launch=True. Called on startup."""
-        from . import database as db
+        if __package__:
+            from . import database as db
+        else:
+            import database as db
 
         profiles = db.list_profiles()
         auto_profiles = [p for p in profiles if p.get("auto_launch")]

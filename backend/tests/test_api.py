@@ -315,6 +315,45 @@ def test_get_clipboard_from_page(app_client: TestClient):
     main.browser_mgr.running.pop(pid, None)
 
 
+def test_set_and_get_clipboard_without_vnc_uses_cache(app_client: TestClient):
+    """Non-VNC profiles should not require xclip for clipboard relay."""
+    create = app_client.post("/api/profiles", json={"name": "NoVncClip"})
+    pid = create.json()["id"]
+
+    mock_page = AsyncMock()
+    mock_page.evaluate = AsyncMock(return_value="")
+
+    mock_context = MagicMock()
+    mock_context.pages = [mock_page]
+
+    mock_running = MagicMock(spec=RunningProfile)
+    mock_running.display = None
+    mock_running.ws_port = None
+    mock_running.cdp_port = 5100
+    mock_running.context = mock_context
+    main.browser_mgr.running[pid] = mock_running
+
+    with patch(
+        "backend.main.asyncio.create_subprocess_exec",
+        new_callable=AsyncMock,
+        side_effect=AssertionError("xclip should not be called without VNC"),
+    ):
+        set_resp = app_client.post(
+            f"/api/profiles/{pid}/clipboard",
+            json={"text": "cached clipboard"},
+        )
+        get_resp = app_client.get(f"/api/profiles/{pid}/clipboard")
+
+    assert set_resp.status_code == 200
+    assert set_resp.json() == {"ok": True}
+    assert get_resp.status_code == 200
+    assert get_resp.json()["text"] == "cached clipboard"
+
+    # Cleanup
+    main.browser_mgr.running.pop(pid, None)
+    main._profile_clipboards.pop(pid, None)
+
+
 # ── Response shape ───────────────────────────────────────────────────────────
 
 

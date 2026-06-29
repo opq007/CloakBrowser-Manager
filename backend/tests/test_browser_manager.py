@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -16,6 +17,7 @@ from backend.browser_manager import (
     _normalize_proxy,
     _validate_proxy,
     BrowserManager,
+    RunningProfile,
 )
 
 
@@ -140,6 +142,57 @@ def test_build_args_empty_profile():
     args = _mgr._build_fingerprint_args({})
     # Only the 3 base args
     assert len(args) == 3
+
+
+@pytest.mark.asyncio
+async def test_launch_without_vnc_skips_display_and_xvnc(tmp_path: Path):
+    mgr = BrowserManager(enable_vnc=False)
+    mgr.vnc.allocate = AsyncMock()
+    mgr.vnc.start_vnc = AsyncMock()
+    mgr.vnc.stop_vnc = AsyncMock()
+
+    context = MagicMock()
+    context.pages = []
+    context.add_init_script = AsyncMock()
+    context.on = MagicMock()
+
+    profile = {
+        "id": "no-vnc",
+        "user_data_dir": str(tmp_path / "profile"),
+        "screen_width": 1280,
+        "screen_height": 720,
+    }
+
+    with patch(
+        "backend.browser_manager.launch_persistent_context_async",
+        new=AsyncMock(return_value=context),
+    ) as launch_mock:
+        running = await mgr.launch(profile)
+
+    assert running.display is None
+    assert running.ws_port is None
+    mgr.vnc.allocate.assert_not_called()
+    mgr.vnc.start_vnc.assert_not_called()
+    mgr.vnc.stop_vnc.assert_not_called()
+    assert "DISPLAY" not in launch_mock.call_args.kwargs["env"]
+
+
+def test_get_status_running_without_vnc():
+    mgr = BrowserManager(enable_vnc=False)
+    mgr.running["abc"] = RunningProfile(
+        profile_id="abc",
+        context=MagicMock(),
+        display=None,
+        ws_port=None,
+        cdp_port=5100,
+    )
+
+    assert mgr.get_status("abc") == {
+        "status": "running",
+        "vnc_ws_port": None,
+        "display": None,
+        "cdp_url": "/api/profiles/abc/cdp",
+    }
 
 
 # ── launch_args appended to extra_args ────────────────────────────────────────
