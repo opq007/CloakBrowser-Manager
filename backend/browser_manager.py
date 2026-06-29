@@ -181,6 +181,25 @@ class RunningProfile:
     cdp_port: int
 
 
+class UnsupportedEventLoopError(RuntimeError):
+    """Raised when the active asyncio loop cannot launch Playwright subprocesses."""
+
+
+def _ensure_playwright_subprocess_support() -> None:
+    """Playwright needs asyncio subprocess support to start its driver."""
+    if sys.platform != "win32":
+        return
+
+    loop = asyncio.get_running_loop()
+    if isinstance(loop, asyncio.SelectorEventLoop):
+        raise UnsupportedEventLoopError(
+            "Windows launch requires a ProactorEventLoop because Playwright starts "
+            "a subprocess. Do not run the backend with `uvicorn --reload` on Windows; "
+            "start it with `python backend/run.py` from the repo root or run "
+            "`uvicorn main:app --port 8080` from the backend directory."
+        )
+
+
 class BrowserManager:
     def __init__(self, enable_vnc: bool | None = None):
         self.running: dict[str, RunningProfile] = {}
@@ -193,6 +212,7 @@ class BrowserManager:
 
     async def launch(self, profile: dict[str, Any]) -> RunningProfile:
         """Launch a browser instance for the given profile."""
+        _ensure_playwright_subprocess_support()
         profile_id = profile["id"]
 
         async with self._lock:

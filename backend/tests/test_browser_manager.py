@@ -2,23 +2,49 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import socket
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import socket
-
+import backend.browser_manager as browser_manager
 from backend.browser_manager import (
-    BASE_CDP_PORT,
-    CDP_PORT_RANGE,
     _init_profile_defaults,
     _normalize_proxy,
     _validate_proxy,
+    _ensure_playwright_subprocess_support,
     BrowserManager,
     RunningProfile,
+    UnsupportedEventLoopError,
 )
+
+
+def _free_port_block(count: int) -> int:
+    """Find a contiguous localhost port range for allocation tests."""
+    for base in range(20000, 60000 - count):
+        sockets = []
+        try:
+            for offset in range(count):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("127.0.0.1", base + offset))
+                sockets.append(s)
+            return base
+        except OSError:
+            continue
+        finally:
+            for s in sockets:
+                s.close()
+    raise RuntimeError("Could not find a free port block for tests")
+
+
+def _use_test_cdp_range(monkeypatch: pytest.MonkeyPatch, count: int = 5) -> tuple[int, int]:
+    base = _free_port_block(count)
+    monkeypatch.setattr(browser_manager, "BASE_CDP_PORT", base)
+    monkeypatch.setattr(browser_manager, "CDP_PORT_RANGE", count)
+    return base, count
 
 
 # ── _normalize_proxy ─────────────────────────────────────────────────────────
@@ -195,6 +221,21 @@ def test_get_status_running_without_vnc():
     }
 
 
+def test_windows_selector_loop_is_rejected(monkeypatch: pytest.MonkeyPatch):
+    loop = asyncio.SelectorEventLoop()
+    try:
+        monkeypatch.setattr("backend.browser_manager.sys.platform", "win32")
+        monkeypatch.setattr(
+            "backend.browser_manager.asyncio.get_running_loop",
+            lambda: loop,
+        )
+
+        with pytest.raises(UnsupportedEventLoopError, match="ProactorEventLoop"):
+            _ensure_playwright_subprocess_support()
+    finally:
+        loop.close()
+
+
 # ── launch_args appended to extra_args ────────────────────────────────────────
 
 
@@ -232,46 +273,51 @@ def test_launch_args_none_no_effect():
 # ── _allocate_cdp_port ───────────────────────────────────────────────────────
 
 
-def test_allocate_cdp_port_returns_free_port():
+def test_allocate_cdp_port_returns_free_port(monkeypatch: pytest.MonkeyPatch):
+    base, count = _use_test_cdp_range(monkeypatch)
     mgr = BrowserManager()
     port = mgr._allocate_cdp_port()
-    assert BASE_CDP_PORT <= port < BASE_CDP_PORT + CDP_PORT_RANGE
+    assert base <= port < base + count
 
 
-def test_allocate_cdp_port_skips_occupied():
+def test_allocate_cdp_port_skips_occupied(monkeypatch: pytest.MonkeyPatch):
+    base, _ = _use_test_cdp_range(monkeypatch)
     mgr = BrowserManager()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as blocker:
         blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        blocker.bind(("127.0.0.1", BASE_CDP_PORT))
+        blocker.bind(("127.0.0.1", base))
         blocker.listen(1)
         port = mgr._allocate_cdp_port()
-        assert port == BASE_CDP_PORT + 1
+        assert port == base + 1
 
 
-def test_allocate_cdp_port_advances_counter():
+def test_allocate_cdp_port_advances_counter(monkeypatch: pytest.MonkeyPatch):
+    _use_test_cdp_range(monkeypatch)
     mgr = BrowserManager()
     p1 = mgr._allocate_cdp_port()
     p2 = mgr._allocate_cdp_port()
     assert p2 == p1 + 1
 
 
-def test_allocate_cdp_port_wraps_around():
+def test_allocate_cdp_port_wraps_around(monkeypatch: pytest.MonkeyPatch):
+    base, count = _use_test_cdp_range(monkeypatch)
     mgr = BrowserManager()
-    mgr._next_cdp_port = BASE_CDP_PORT + CDP_PORT_RANGE - 1
+    mgr._next_cdp_port = base + count - 1
     p1 = mgr._allocate_cdp_port()
-    assert p1 == BASE_CDP_PORT + CDP_PORT_RANGE - 1
+    assert p1 == base + count - 1
     p2 = mgr._allocate_cdp_port()
-    assert p2 == BASE_CDP_PORT
+    assert p2 == base
 
 
-def test_allocate_cdp_port_all_occupied_raises():
+def test_allocate_cdp_port_all_occupied_raises(monkeypatch: pytest.MonkeyPatch):
+    base, count = _use_test_cdp_range(monkeypatch, count=3)
     mgr = BrowserManager()
     blockers = []
     try:
-        for i in range(CDP_PORT_RANGE):
+        for i in range(count):
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            s.bind(("127.0.0.1", BASE_CDP_PORT + i))
+            s.bind(("127.0.0.1", base + i))
             s.listen(1)
             blockers.append(s)
         with pytest.raises(ValueError, match="No free CDP ports"):

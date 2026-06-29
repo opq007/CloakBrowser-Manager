@@ -84,6 +84,19 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8080
 ```
 
+On Windows, run without uvicorn reload so Playwright can start its driver
+subprocess on a ProactorEventLoop:
+
+```powershell
+.\backend\.venv\Scripts\python.exe backend\run.py
+```
+
+Or from `backend/`:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn main:app --port 8080
+```
+
 ### Frontend
 
 ```bash

@@ -26,7 +26,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 if __package__:
     from . import database as db
-    from .browser_manager import BrowserManager
+    from .browser_manager import BrowserManager, UnsupportedEventLoopError
     from .models import (
         ClipboardRequest,
         LaunchResponse,
@@ -40,7 +40,7 @@ if __package__:
     )
 else:
     import database as db
-    from browser_manager import BrowserManager
+    from browser_manager import BrowserManager, UnsupportedEventLoopError
     from models import (
         ClipboardRequest,
         LaunchResponse,
@@ -549,6 +549,8 @@ async def launch_profile(profile_id: str):
         running = await browser_mgr.launch(profile)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except UnsupportedEventLoopError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
     except Exception as exc:
         logger.error("Failed to launch profile %s: %s", profile_id, exc)
         raise HTTPException(status_code=500, detail="Failed to launch browser")
